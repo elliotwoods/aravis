@@ -62,6 +62,12 @@ stream_cb (void *user_data, ArvStreamCallbackType type, ArvBuffer *buffer)
 }
 ```
 
+On macOS, [func@Aravis.make_thread_realtime] puts the thread in the Mach time
+constraint policy, and [func@Aravis.make_thread_high_priority] sets its quality
+of service class to user interactive. Neither requires any privilege. Under
+machine load, the real-time policy is the one that keeps a fast stream thread
+from being starved.
+
 ## Stream Packet Size
 
 One way to increase streaming performance and lower the CPU use is to increase
