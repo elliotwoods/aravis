@@ -38,6 +38,7 @@
 #include <arvmisc.h>
 #include <arvmiscprivate.h>
 #include <arvnetworkprivate.h>
+#include <arvrealtime.h>
 #include <arvstr.h>
 #include <arvenumtypes.h>
 #include <stddef.h>
@@ -58,9 +59,18 @@
 #include <sys/mman.h>
 #endif
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <pthread.h>
+#include <sys/sysctl.h>
+#endif
+
 #define ARV_GV_STREAM_DISCARD_LATE_FRAME_THRESHOLD	100
+#define ARV_GV_STREAM_THREAD_STATS_PERIOD_US		100000
 #define ARV_GV_STREAM_BUFFER_SIZE_PROTOCOL_OVERHEAD     1024 /* Some room for protocol overhead (IP + UDP + GV) */
 #define ARV_GV_STREAM_MIN_BUFFER_SIZE                   20 * 1024
+#define ARV_GV_STREAM_SOCKET_BUFFER_FLOOR               (1024 * 1024)
+#define ARV_GV_STREAM_SOCKET_BUFFER_MAX_REQUEST         (64 * 1024 * 1024) /* "max" where the limit can't be read */
 
 enum {
 	ARV_GV_STREAM_PROPERTY_0,
@@ -186,12 +196,28 @@ struct _ArvGvStreamThreadData {
         guint64 n_transferred_bytes;
         guint64 n_ignored_bytes;
 
+	/* Receive path diagnostics */
+
+	guint64 socket_buffer_size_granted;	/* "socket_buffer_size": SO_RCVBUF read back, 0 if never set */
+	guint64 n_underrun_frames;		/* distinct frames that found no input buffer */
+	guint64 last_underrun_frame_id;
+	gboolean has_underrun_frame;
+	guint64 n_rx_wakeups;			/* poll returned with the socket readable */
+	guint64 n_rx_batches;			/* receive calls returning at least one packet */
+	guint64 n_rx_max_batch;			/* most packets returned by one receive call */
+	guint64 stream_thread_cpu_us;		/* user + system CPU time of the stream thread (Apple only) */
+	guint64 thread_priority_mode;		/* 0 default, 1 high (QoS), 2 realtime: what was achieved */
+	guint64 stream_thread_min_priority;	/* lowest scheduler priority observed (Apple only) */
+	guint64 last_thread_stats_us;
+
 	ArvHistogram *histogram;
 	guint32 statistic_count;
 
 	ArvGvStreamSocketBuffer socket_buffer_option;
 	int socket_buffer_size;
 	int current_socket_buffer_size;
+	int last_attempted_socket_buffer_size;	/* never retried: a refused size is refused every time */
+	int configured_socket_buffer_size;	/* obtained by _configure_socket_buffer, the floor for _update_socket */
 };
 
 static void
@@ -221,10 +247,66 @@ _send_packet_request (ArvGvStreamThreadData *thread_data,
 	arv_gvcp_packet_free (packet);
 }
 
+static guint64
+_read_socket_buffer_size (int fd)
+{
+#ifdef G_OS_WIN32
+	DWORD size = 0;
+#else
+	gint size = 0;
+#endif
+	socklen_t optlen = sizeof (size);
+
+	if (getsockopt (fd, SOL_SOCKET, SO_RCVBUF, (char *) &size, &optlen) != 0 || size < 0)
+		return 0;
+
+	return size;
+}
+
+/* Samples the stream thread's CPU time and scheduler priority, at most every
+ * ARV_GV_STREAM_THREAD_STATS_PERIOD_US unless forced. Only implemented on Apple,
+ * where a real-time thread demoted by the kernel's fail-safe shows up as a drop
+ * of the observed priority. Must be called from the stream thread. */
+
+static void
+_sample_thread_stats (ArvGvStreamThreadData *thread_data, guint64 time_us, gboolean force)
+{
+#ifdef __APPLE__
+	thread_basic_info_data_t basic_info;
+	thread_extended_info_data_t extended_info;
+	mach_msg_type_number_t count;
+	thread_act_t thread;
+
+	if (!force && time_us - thread_data->last_thread_stats_us < ARV_GV_STREAM_THREAD_STATS_PERIOD_US)
+		return;
+
+	thread_data->last_thread_stats_us = time_us;
+
+	/* pthread_mach_thread_np does not add a port reference, unlike mach_thread_self */
+	thread = pthread_mach_thread_np (pthread_self ());
+
+	count = THREAD_BASIC_INFO_COUNT;
+	if (thread_info (thread, THREAD_BASIC_INFO, (thread_info_t) &basic_info, &count) == KERN_SUCCESS)
+		thread_data->stream_thread_cpu_us =
+			(guint64) basic_info.user_time.seconds * 1000000 + basic_info.user_time.microseconds +
+			(guint64) basic_info.system_time.seconds * 1000000 + basic_info.system_time.microseconds;
+
+	count = THREAD_EXTENDED_INFO_COUNT;
+	if (thread_info (thread, THREAD_EXTENDED_INFO, (thread_info_t) &extended_info, &count) == KERN_SUCCESS &&
+	    extended_info.pth_curpri >= 0) {
+		if (thread_data->stream_thread_min_priority == 0 ||
+		    (guint64) extended_info.pth_curpri < thread_data->stream_thread_min_priority)
+			thread_data->stream_thread_min_priority = extended_info.pth_curpri;
+	}
+#endif
+}
+
 static void
 _update_socket (ArvGvStreamThreadData *thread_data, ArvBuffer *buffer)
 {
 	int buffer_size = thread_data->current_socket_buffer_size;
+	int granted_size = 0;
+	gboolean result;
 	int fd;
 
 	if (thread_data->socket_buffer_option == ARV_GV_STREAM_SOCKET_BUFFER_FIXED &&
@@ -249,17 +331,131 @@ _update_socket (ArvGvStreamThreadData *thread_data, ArvBuffer *buffer)
 
         buffer_size = MAX (buffer_size, ARV_GV_STREAM_MIN_BUFFER_SIZE);
 
-	if (buffer_size != thread_data->current_socket_buffer_size) {
-		gboolean result;
+	/* Never shrink the buffer obtained at thread start */
+	if (buffer_size <= thread_data->configured_socket_buffer_size)
+		return;
 
-		result = arv_socket_set_recv_buffer_size (fd, buffer_size);
-		if (result) {
-			thread_data->current_socket_buffer_size = buffer_size;
-			arv_info_stream_thread ("[GvStream::update_socket] Socket buffer size set to %d", buffer_size);
-		} else {
-			arv_warning_stream_thread ("[GvStream::update_socket] Failed to set socket buffer size to %d (%d)",
-						   buffer_size, errno);
+	/* This runs for every new frame: a size that was already tried, whether it was granted or not,
+	 * is not tried again. */
+	if (buffer_size == thread_data->current_socket_buffer_size ||
+	    buffer_size == thread_data->last_attempted_socket_buffer_size)
+		return;
+
+	thread_data->last_attempted_socket_buffer_size = buffer_size;
+
+	result = arv_socket_set_recv_buffer_size_full (fd, buffer_size, &granted_size);
+	if (granted_size > 0)
+		thread_data->socket_buffer_size_granted = granted_size;
+
+	if (result) {
+		thread_data->current_socket_buffer_size = buffer_size;
+		if (granted_size < buffer_size)
+			arv_warning_stream_thread ("[GvStream::update_socket] Socket buffer size %d requested,"
+						   " the kernel granted %d; you might see missing packets",
+						   buffer_size, granted_size);
+		else
+			arv_info_stream_thread ("[GvStream::update_socket] Socket buffer size set to %d (granted %d)",
+						buffer_size, granted_size);
+	} else {
+		arv_warning_stream_thread ("[GvStream::update_socket] Failed to set socket buffer size to %d (%s),"
+					   " current size %d",
+					   buffer_size, g_strerror (errno), granted_size);
+	}
+}
+
+static int
+_get_max_socket_buffer_size (void)
+{
+#ifdef __APPLE__
+	int max_size = 0;
+	size_t length = sizeof (max_size);
+
+	if (sysctlbyname ("kern.ipc.maxsockbuf", &max_size, &length, NULL, 0) == 0 && max_size > 0)
+		return max_size;
+
+	arv_warning_stream_thread ("[GvStream::configure_socket_buffer] Can't read kern.ipc.maxsockbuf (%s)",
+				   g_strerror (errno));
+#endif
+	/* Linux clamps silently to net.core.rmem_max; the granted size is read back */
+	return ARV_GV_STREAM_SOCKET_BUFFER_MAX_REQUEST;
+}
+
+/* Sizes the socket receive buffer once, before any receive loop runs.
+ *
+ * ARV_GV_STREAM_SOCKET_BUFFER_SIZE: a byte count, "max" (as large as the kernel grants), or "0" /
+ * "default" to leave the OS default. Unset: "max" on Apple, where the default (786,896 bytes,
+ * under a millisecond of a 10GigE stream) loses most packets of a fast camera; nothing elsewhere.
+ *
+ * On macOS a request above kern.ipc.maxsockbuf is clamped silently the first time and refused with
+ * ENOBUFS when the buffer is already at the maximum, so the granted size is always read back. */
+
+static void
+_configure_socket_buffer (ArvGvStreamThreadData *thread_data)
+{
+	const char *env;
+	gboolean use_max = FALSE;
+	gint64 request = 0;
+	int granted_size = 0;
+	gboolean result = FALSE;
+	int fd;
+
+	fd = g_socket_get_fd (thread_data->socket);
+	env = g_getenv ("ARV_GV_STREAM_SOCKET_BUFFER_SIZE");
+
+	if (env == NULL) {
+#ifdef __APPLE__
+		use_max = TRUE;
+#else
+		return;
+#endif
+	} else if (g_ascii_strcasecmp (env, "max") == 0) {
+		use_max = TRUE;
+	} else if (g_ascii_strcasecmp (env, "default") == 0 || g_strcmp0 (env, "0") == 0) {
+		arv_info_stream_thread ("[GvStream::configure_socket_buffer] Socket buffer left at the OS default"
+					" (%" G_GUINT64_FORMAT " bytes)", _read_socket_buffer_size (fd));
+		return;
+	} else {
+		char *end = NULL;
+
+		request = g_ascii_strtoll (env, &end, 10);
+		if (end == env || *end != '\0' || request <= 0 || request > G_MAXINT) {
+			arv_warning_stream_thread ("[GvStream::configure_socket_buffer] Invalid"
+						   " ARV_GV_STREAM_SOCKET_BUFFER_SIZE '%s' (expected a byte count,"
+						   " 'max', '0' or 'default'); socket buffer left at the OS default",
+						   env);
+			return;
 		}
+	}
+
+	if (use_max) {
+		request = _get_max_socket_buffer_size ();
+
+		for (;;) {
+			result = arv_socket_set_recv_buffer_size_full (fd, request, &granted_size);
+			if (result && granted_size >= ARV_GV_STREAM_SOCKET_BUFFER_FLOOR)
+				break;
+			if (request <= ARV_GV_STREAM_SOCKET_BUFFER_FLOOR)
+				break;
+			request = MAX (request * 7 / 8, ARV_GV_STREAM_SOCKET_BUFFER_FLOOR);
+		}
+	} else {
+		result = arv_socket_set_recv_buffer_size_full (fd, request, &granted_size);
+	}
+
+	if (granted_size > 0)
+		thread_data->socket_buffer_size_granted = granted_size;
+
+	if (result) {
+		/* Linux reports twice the size it was asked for; the floor is what was asked and granted */
+		thread_data->configured_socket_buffer_size = MIN (request, granted_size);
+		thread_data->current_socket_buffer_size = thread_data->configured_socket_buffer_size;
+		arv_info_stream_thread ("[GvStream::configure_socket_buffer] Socket buffer: requested %" G_GINT64_FORMAT
+					" bytes (%s), granted %d bytes",
+					request, use_max ? "max" : "ARV_GV_STREAM_SOCKET_BUFFER_SIZE", granted_size);
+	} else {
+		arv_warning_stream_thread ("[GvStream::configure_socket_buffer] Failed to set socket buffer to %"
+					   G_GINT64_FORMAT " bytes (%s), current size %d bytes",
+					   request, g_strerror (errno), granted_size);
 	}
 }
 
@@ -373,7 +569,13 @@ _find_frame_data (ArvGvStreamThreadData *thread_data,
 
 	buffer = arv_stream_pop_input_buffer (thread_data->stream);
 	if (buffer == NULL) {
+		/* Counts every packet of a frame that found no input buffer */
 		thread_data->n_underruns++;
+		if (!thread_data->has_underrun_frame || thread_data->last_underrun_frame_id != frame_id) {
+			thread_data->n_underrun_frames++;
+			thread_data->last_underrun_frame_id = frame_id;
+			thread_data->has_underrun_frame = TRUE;
+		}
 
 		return NULL;
 	}
@@ -997,7 +1199,7 @@ _loop (ArvGvStreamThreadData *thread_data)
 	ArvGvStreamFrameData *frame;
 	ArvGvspPacket *packet_buffers;
 	GPollFD poll_fd[2];
-	guint64 time_us;
+	guint64 time_us = 0;
 	gboolean use_poll;
 	int i;
 	GInputVector packet_iv[ARV_GV_STREAM_NUM_BUFFERS] = { {NULL, 0}, };
@@ -1050,6 +1252,8 @@ _loop (ArvGvStreamThreadData *thread_data)
                         GError *error = NULL;
                         int n_msgs;
 
+			thread_data->n_rx_wakeups++;
+
 			arv_gpollfd_clear_one (&poll_fd[0], thread_data->socket);
 			n_msgs = g_socket_receive_messages (thread_data->socket,
 		 					    packet_im,
@@ -1060,6 +1264,9 @@ _loop (ArvGvStreamThreadData *thread_data)
 
                         if (G_LIKELY(n_msgs > 0)) {
                                 time_us = g_get_monotonic_time ();
+                                thread_data->n_rx_batches++;
+                                if ((guint64) n_msgs > thread_data->n_rx_max_batch)
+                                        thread_data->n_rx_max_batch = n_msgs;
                                 for (i = 0; i < n_msgs; i++) {
                                         frame = _process_packet (thread_data,
                                                                  packet_iv[i].buffer,
@@ -1076,6 +1283,8 @@ _loop (ArvGvStreamThreadData *thread_data)
                         time_us = g_get_monotonic_time ();
                         _check_frame_completion (thread_data, time_us, NULL);
                 }
+
+		_sample_thread_stats (thread_data, time_us, FALSE);
 
 	} while (!g_cancellable_is_cancelled (thread_data->cancellable));
 
@@ -1419,6 +1628,98 @@ af_packet_error:
 
 #endif /* ARAVIS_HAS_PACKET_SOCKET */
 
+typedef enum {
+	ARV_GV_STREAM_THREAD_PRIORITY_DEFAULT = 0,
+	ARV_GV_STREAM_THREAD_PRIORITY_HIGH = 1,
+	ARV_GV_STREAM_THREAD_PRIORITY_REALTIME = 2
+} ArvGvStreamThreadPriority;
+
+static const char *
+_thread_priority_to_string (ArvGvStreamThreadPriority mode)
+{
+	switch (mode) {
+		case ARV_GV_STREAM_THREAD_PRIORITY_HIGH:
+			return "high";
+		case ARV_GV_STREAM_THREAD_PRIORITY_REALTIME:
+			return "realtime";
+		default:
+			return "default";
+	}
+}
+
+/* Raises the priority of the calling stream thread, from ARV_GV_STREAM_THREAD_PRIORITY = default |
+ * high | realtime. Unset: realtime on Apple, default elsewhere. A refused realtime request falls
+ * back to high, and a refused high request leaves the thread as it is. What was achieved is
+ * exported as thread_priority_mode.
+ *
+ * On Apple, realtime is the Mach time constraint policy (see arv_make_thread_realtime). The kernel
+ * demotes a real-time thread that computes for about 100 quanta without blocking; _loop blocks in
+ * g_poll whenever the socket is empty, which resets that counter. A receive loop that never blocks
+ * (busy polling) would be demoted, which stream_thread_min_priority makes visible. */
+
+static void
+_configure_thread_priority (ArvGvStreamThreadData *thread_data)
+{
+	ArvGvStreamThreadPriority requested;
+	ArvGvStreamThreadPriority achieved = ARV_GV_STREAM_THREAD_PRIORITY_DEFAULT;
+	const char *env;
+
+#ifdef __APPLE__
+	{
+		char name[64] = "";
+
+		/* GLib names its threads on Apple, but not every build does */
+		if (pthread_getname_np (pthread_self (), name, sizeof (name)) != 0 || name[0] == '\0') {
+			pthread_setname_np ("arv_gv_stream");
+			arv_debug_stream_thread ("[GvStream::configure_thread_priority] Thread named arv_gv_stream");
+		} else {
+			arv_debug_stream_thread ("[GvStream::configure_thread_priority] Thread already named '%s'",
+						 name);
+		}
+	}
+	requested = ARV_GV_STREAM_THREAD_PRIORITY_REALTIME;
+#else
+	requested = ARV_GV_STREAM_THREAD_PRIORITY_DEFAULT;
+#endif
+
+	env = g_getenv ("ARV_GV_STREAM_THREAD_PRIORITY");
+	if (env != NULL) {
+		if (g_ascii_strcasecmp (env, "default") == 0)
+			requested = ARV_GV_STREAM_THREAD_PRIORITY_DEFAULT;
+		else if (g_ascii_strcasecmp (env, "high") == 0)
+			requested = ARV_GV_STREAM_THREAD_PRIORITY_HIGH;
+		else if (g_ascii_strcasecmp (env, "realtime") == 0)
+			requested = ARV_GV_STREAM_THREAD_PRIORITY_REALTIME;
+		else
+			arv_warning_stream_thread ("[GvStream::configure_thread_priority] Invalid"
+						   " ARV_GV_STREAM_THREAD_PRIORITY '%s' (expected default, high or"
+						   " realtime), using %s", env, _thread_priority_to_string (requested));
+	}
+
+	if (requested == ARV_GV_STREAM_THREAD_PRIORITY_REALTIME) {
+		/* The priority argument is used by the Linux implementation; Mach has no equivalent */
+		if (arv_make_thread_realtime (10))
+			achieved = ARV_GV_STREAM_THREAD_PRIORITY_REALTIME;
+		else
+			requested = ARV_GV_STREAM_THREAD_PRIORITY_HIGH;
+	}
+
+	if (requested == ARV_GV_STREAM_THREAD_PRIORITY_HIGH) {
+		if (arv_make_thread_high_priority (-10))
+			achieved = ARV_GV_STREAM_THREAD_PRIORITY_HIGH;
+	}
+
+	thread_data->thread_priority_mode = achieved;
+
+	if (env != NULL)
+		arv_info_stream_thread ("[GvStream::configure_thread_priority] Stream thread priority: %s"
+					" (ARV_GV_STREAM_THREAD_PRIORITY=%s)",
+					_thread_priority_to_string (achieved), env);
+	else
+		arv_info_stream_thread ("[GvStream::configure_thread_priority] Stream thread priority: %s"
+					" (platform default)", _thread_priority_to_string (achieved));
+}
+
 static void *
 arv_gv_stream_thread (void *data)
 {
@@ -1430,6 +1731,10 @@ arv_gv_stream_thread (void *data)
 	thread_data->frames = NULL;
 	thread_data->last_frame_id = 0;
 	thread_data->first_packet = TRUE;
+
+	_configure_socket_buffer (thread_data);
+	/* Before the INIT callback, so that an application's own handler has the last word */
+	_configure_thread_priority (thread_data);
 
 	if (thread_data->callback != NULL)
 		thread_data->callback (thread_data->callback_data, ARV_STREAM_CALLBACK_TYPE_INIT, NULL);
@@ -1443,6 +1748,8 @@ arv_gv_stream_thread (void *data)
 		_loop (thread_data);
 
 	_flush_frames (thread_data, g_get_monotonic_time ());
+
+	_sample_thread_stats (thread_data, g_get_monotonic_time (), TRUE);
 
 	if (thread_data->callback != NULL)
 		thread_data->callback (thread_data->callback_data, ARV_STREAM_CALLBACK_TYPE_EXIT, NULL);
@@ -1764,6 +2071,22 @@ arv_gv_stream_constructed (GObject *object)
                                  G_TYPE_UINT64, &priv->thread_data->n_transferred_bytes);
         arv_stream_declare_info (ARV_STREAM (gv_stream), "n_ignored_bytes",
                                  G_TYPE_UINT64, &priv->thread_data->n_ignored_bytes);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "socket_buffer_size",
+                                 G_TYPE_UINT64, &priv->thread_data->socket_buffer_size_granted);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_underrun_frames",
+                                 G_TYPE_UINT64, &priv->thread_data->n_underrun_frames);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_rx_wakeups",
+                                 G_TYPE_UINT64, &priv->thread_data->n_rx_wakeups);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_rx_batches",
+                                 G_TYPE_UINT64, &priv->thread_data->n_rx_batches);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_rx_max_batch",
+                                 G_TYPE_UINT64, &priv->thread_data->n_rx_max_batch);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "stream_thread_cpu_us",
+                                 G_TYPE_UINT64, &priv->thread_data->stream_thread_cpu_us);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "thread_priority_mode",
+                                 G_TYPE_UINT64, &priv->thread_data->thread_priority_mode);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "stream_thread_min_priority",
+                                 G_TYPE_UINT64, &priv->thread_data->stream_thread_min_priority);
 
 	arv_gv_stream_start_thread (ARV_STREAM (gv_stream));
 }
