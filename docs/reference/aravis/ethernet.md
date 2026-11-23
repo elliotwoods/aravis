@@ -108,6 +108,22 @@ example, the following command gives this capability to the Aravis viewer:
 sudo setcap cap_net_raw+ep arv-viewer
 ```
 
+## Connected Stream Socket
+
+On some platforms, macOS in particular, the kernel spends much less time per
+received packet on a connected UDP socket than on an unconnected one, which
+matters for high packet rates. The `ARV_GV_STREAM_OPTION_CONNECTED_SOCKET`
+stream option connects the stream socket to the device stream source, learnt
+from the first received stream packets. Packet resend requests are then sent
+from a separate socket. This option is off by default, and can be tried with
+the `--connected-socket` option of `arv-camera-test`. In your code, it must be
+set before the stream creation:
+
+```c
+arv_camera_gv_set_stream_options (camera, ARV_GV_STREAM_OPTION_CONNECTED_SOCKET);
+stream = arv_camera_create_stream (camera, NULL, NULL, NULL, &error);
+```
+
 # Legacy endianess mechanism
 
 Some GigEVision devices incorrectly report a Genicam schema version greater or

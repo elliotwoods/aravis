@@ -37,11 +37,16 @@ G_BEGIN_DECLS
  * ArvGvStreamOption:
  * @ARV_GV_STREAM_OPTION_NONE: no option specified
  * @ARV_GV_STREAM_OPTION_PACKET_SOCKET_DISABLED: use of packet socket is disabled
+ * @ARV_GV_STREAM_OPTION_CONNECTED_SOCKET: connect the stream socket to the device stream source, learnt from the
+ * first received packets, which lowers the per packet receive cost on some platforms (macOS). The association is
+ * learnt again at each acquisition start and after 1 s without packet. Packet resend requests are sent from a
+ * separate socket. It has no effect on the Linux packet socket receive method (Since 0.10.0)
  */
 
 typedef enum {
 	ARV_GV_STREAM_OPTION_NONE =                             0,
 	ARV_GV_STREAM_OPTION_PACKET_SOCKET_DISABLED =           1 << 0,
+	ARV_GV_STREAM_OPTION_CONNECTED_SOCKET =                 1 << 1,
 } ArvGvStreamOption;
 
 /**
