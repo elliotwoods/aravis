@@ -240,6 +240,13 @@ static pid_t _gettid(void) {
  * Try to make current thread realtime. It first try to use sched_setscheduler,
  * and if it fails, use rtkit.
  *
+ * On macOS, the thread is put in the Mach time constraint policy, which does
+ * not require any privilege. The policy is aperiodic, with a computation time
+ * of 500 µs within a constraint of 1 ms. Mach has no priority level for this
+ * policy, @priority is ignored. The kernel demotes a time constraint thread
+ * which runs for a long time without blocking, it is only useful for a thread
+ * that regularly waits for data, like a stream receiving thread.
+ *
  * Since: 0.4.0
  */
 
@@ -294,6 +301,10 @@ arv_make_thread_realtime (int priority)
  * Returns: %TRUE on success.
  *
  * Try to set current thread nice level to high priority, using rtkit.
+ *
+ * On macOS, the thread quality of service class is set to
+ * QOS_CLASS_USER_INTERACTIVE. Mach has no per thread nice level, @nice_level
+ * is ignored.
  *
  * Since: 0.4.0
  */
@@ -354,12 +365,85 @@ arv_make_thread_high_priority (int priority)
 	return TRUE;
 }
 
+#elif defined(__APPLE__)
+
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#include <pthread/qos.h>
+
+#define ARV_MACH_RT_COMPUTATION_US	500
+#define ARV_MACH_RT_CONSTRAINT_US	1000
+
+static uint32_t
+_us_to_mach_absolute_time (guint64 us, const mach_timebase_info_data_t *timebase)
+{
+	guint64 ticks;
+
+	us = MIN (us, G_USEC_PER_SEC);
+	ticks = us * 1000 * timebase->denom / timebase->numer;
+
+	return ticks > G_MAXUINT32 ? G_MAXUINT32 : (uint32_t) ticks;
+}
+
+gboolean
+arv_make_thread_realtime (int priority)
+{
+	thread_time_constraint_policy_data_t policy;
+	mach_timebase_info_data_t timebase;
+	kern_return_t result;
+
+	if (mach_timebase_info (&timebase) != KERN_SUCCESS || timebase.numer == 0) {
+		arv_warning_misc ("mach_timebase_info failed, thread not made realtime");
+		return FALSE;
+	}
+
+	policy.period = 0;
+	policy.computation = _us_to_mach_absolute_time (ARV_MACH_RT_COMPUTATION_US, &timebase);
+	policy.constraint = _us_to_mach_absolute_time (ARV_MACH_RT_CONSTRAINT_US, &timebase);
+	policy.preemptible = TRUE;
+
+	/* pthread_mach_thread_np does not allocate a port right, unlike mach_thread_self */
+	result = thread_policy_set (pthread_mach_thread_np (pthread_self ()),
+				    THREAD_TIME_CONSTRAINT_POLICY,
+				    (thread_policy_t) &policy,
+				    THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+	if (result != KERN_SUCCESS) {
+		arv_warning_misc ("thread_policy_set (THREAD_TIME_CONSTRAINT_POLICY) failed: %s (%d)",
+				  mach_error_string (result), result);
+		return FALSE;
+	}
+
+	arv_info_misc ("Thread made realtime (Mach time constraint policy, computation %d us, constraint %d us)",
+		       ARV_MACH_RT_COMPUTATION_US, ARV_MACH_RT_CONSTRAINT_US);
+
+	return TRUE;
+}
+
+gboolean
+arv_make_thread_high_priority (int nice_level)
+{
+	int result;
+
+	result = pthread_set_qos_class_self_np (QOS_CLASS_USER_INTERACTIVE, 0);
+	if (result != 0) {
+		arv_warning_misc ("pthread_set_qos_class_self_np (QOS_CLASS_USER_INTERACTIVE) failed: %s",
+				  g_strerror (result));
+		return FALSE;
+	}
+
+	arv_info_misc ("Thread made high-priority (QOS_CLASS_USER_INTERACTIVE)");
+
+	return TRUE;
+}
+
 #else
 
 gboolean
 arv_make_thread_realtime (int priority)
 {
-	arv_info_misc ("SCHED API not supported on OSX");
+	arv_info_misc ("SCHED API not supported on this platform");
 
 	return FALSE;
 }
@@ -367,7 +451,7 @@ arv_make_thread_realtime (int priority)
 gboolean
 arv_make_thread_high_priority (int nice_level)
 {
-	arv_info_misc ("RtKit not supported on OSX");
+	arv_info_misc ("RtKit not supported on this platform");
 
 	return FALSE;
 }
