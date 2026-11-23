@@ -32,6 +32,7 @@ static int arv_option_gv_packet_size = -1;
 static gboolean arv_option_realtime = FALSE;
 static gboolean arv_option_high_priority = FALSE;
 static gboolean arv_option_no_packet_socket = FALSE;
+static gboolean arv_option_connected_socket = FALSE;
 static gboolean arv_option_multipart = FALSE;
 static char *arv_option_chunks = NULL;
 static int arv_option_bandwidth_limit = -1;
@@ -185,6 +186,11 @@ static const GOptionEntry arv_option_entries[] =
 	{
 		"no-packet-socket",			'\0', 0, G_OPTION_ARG_NONE,
 		&arv_option_no_packet_socket,		"Disable use of packet socket",
+		NULL
+	},
+	{
+		"connected-socket",			'\0', 0, G_OPTION_ARG_NONE,
+		&arv_option_connected_socket,		"Connect the stream socket to the device",
 		NULL
 	},
 	{
@@ -596,9 +602,13 @@ main (int argc, char **argv)
 			if (error == NULL) arv_camera_gv_select_stream_channel (camera, arv_option_gv_stream_channel, &error);
 			if (error == NULL) arv_camera_gv_set_packet_delay (camera, arv_option_gv_packet_delay, &error);
 			if (error == NULL) arv_camera_gv_set_packet_size (camera, arv_option_gv_packet_size, &error);
-                        arv_camera_gv_set_stream_options (camera, arv_option_no_packet_socket ?
-                                                          ARV_GV_STREAM_OPTION_PACKET_SOCKET_DISABLED :
-                                                          ARV_GV_STREAM_OPTION_NONE);
+                        arv_camera_gv_set_stream_options (camera,
+                                                          (arv_option_no_packet_socket ?
+                                                           ARV_GV_STREAM_OPTION_PACKET_SOCKET_DISABLED :
+                                                           ARV_GV_STREAM_OPTION_NONE) |
+                                                          (arv_option_connected_socket ?
+                                                           ARV_GV_STREAM_OPTION_CONNECTED_SOCKET :
+                                                           ARV_GV_STREAM_OPTION_NONE));
                         if (arv_option_packet_size_adjustment != NULL)
                                 arv_camera_gv_set_packet_size_adjustment (camera, adjustment);
                         if (error == NULL) arv_camera_gv_set_multipart (camera, TRUE,

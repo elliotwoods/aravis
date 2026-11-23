@@ -264,6 +264,130 @@ dynamic_roi_test (void)
 	g_clear_object (&stream);
 }
 
+static void
+pop_complete_buffers (ArvStream *stream, unsigned n_buffers)
+{
+	unsigned i;
+
+	for (i = 0; i < n_buffers; i++) {
+		ArvBuffer *buffer = arv_stream_timeout_pop_buffer (stream, 2000000);
+
+		g_assert (ARV_IS_BUFFER (buffer));
+		g_assert_cmpint (arv_buffer_get_status (buffer), ==, ARV_BUFFER_STATUS_SUCCESS);
+		arv_stream_push_buffer (stream, buffer);
+	}
+}
+
+static void
+flush_output_buffers (ArvStream *stream)
+{
+	ArvBuffer *buffer;
+
+	while ((buffer = arv_stream_try_pop_buffer (stream)) != NULL)
+		arv_stream_push_buffer (stream, buffer);
+}
+
+/* Sends a datagram, too short to be a stream packet, to the stream socket from another socket, until the stream
+ * thread receives it or the timeout expires */
+
+static gboolean
+stream_socket_receives_foreign_datagram (ArvStream *stream, gint64 timeout_us)
+{
+	GSocket *socket;
+	GInetAddress *address;
+	GSocketAddress *socket_address;
+	guint64 n_received_packets;
+	gint64 start_us;
+	gboolean received = FALSE;
+	char datagram[4] = {0};
+
+	socket = g_socket_new (G_SOCKET_FAMILY_IPV4, G_SOCKET_TYPE_DATAGRAM, G_SOCKET_PROTOCOL_UDP, NULL);
+	g_assert (G_IS_SOCKET (socket));
+	address = g_inet_socket_address_get_address (G_INET_SOCKET_ADDRESS (arv_gv_device_get_interface_address
+									   (ARV_GV_DEVICE (arv_camera_get_device (camera)))));
+	socket_address = g_inet_socket_address_new (address, arv_gv_stream_get_port (ARV_GV_STREAM (stream)));
+
+	n_received_packets = arv_stream_get_info_uint64_by_name (stream, "n_received_packets");
+	start_us = g_get_monotonic_time ();
+	do {
+		g_socket_send_to (socket, socket_address, datagram, sizeof (datagram), NULL, NULL);
+		g_usleep (100000);
+		received = arv_stream_get_info_uint64_by_name (stream, "n_received_packets") != n_received_packets;
+	} while (!received && g_get_monotonic_time () - start_us < timeout_us);
+
+	g_object_unref (socket_address);
+	g_object_unref (socket);
+
+	return received;
+}
+
+static void
+connected_socket_test (void)
+{
+	ArvStream *stream;
+	GError *error = NULL;
+	size_t payload;
+	unsigned i;
+
+	/* The connected socket option only applies to the standard socket method */
+	arv_camera_gv_set_stream_options (camera, ARV_GV_STREAM_OPTION_CONNECTED_SOCKET |
+					  ARV_GV_STREAM_OPTION_PACKET_SOCKET_DISABLED);
+	stream = arv_camera_create_stream (camera, NULL, NULL, NULL, &error);
+	arv_camera_gv_set_stream_options (camera, ARV_GV_STREAM_OPTION_NONE);
+	g_assert (ARV_IS_STREAM (stream));
+	g_assert (error == NULL);
+
+	/* Small frames, which fit in the default socket buffer size */
+	arv_camera_set_region (camera, 0, 0, 256, 256, &error);
+	g_assert (error == NULL);
+
+	payload = arv_camera_get_payload (camera, NULL);
+	for (i = 0; i < N_BUFFERS; i++)
+		arv_stream_push_buffer (stream, arv_buffer_new (payload, NULL));
+
+	arv_camera_start_acquisition (camera, &error);
+	g_assert (error == NULL);
+	pop_complete_buffers (stream, 5);
+
+	/* The device stops sending while the stream thread keeps running. The stream socket is connected to the
+	 * device stream source, datagrams from any other port are dropped. */
+	arv_camera_execute_command (camera, "AcquisitionStop", &error);
+	g_assert (error == NULL);
+	g_usleep (200000);
+	g_assert_false (stream_socket_receives_foreign_datagram (stream, 200000));
+
+	/* After 1 s without packet, the socket is disconnected in order to learn the source again */
+	g_assert_true (stream_socket_receives_foreign_datagram (stream, 3000000));
+
+	/* The stream thread state was disturbed by the received datagram: restart it. The source is learnt again. */
+	arv_camera_stop_acquisition (camera, &error);
+	g_assert (error == NULL);
+	flush_output_buffers (stream);
+	arv_camera_start_acquisition (camera, &error);
+	g_assert (error == NULL);
+	pop_complete_buffers (stream, 5);
+
+	/* A stream thread restart while connected disconnects, then learns the source again */
+	arv_camera_stop_acquisition (camera, &error);
+	g_assert (error == NULL);
+	flush_output_buffers (stream);
+	arv_camera_start_acquisition (camera, &error);
+	g_assert (error == NULL);
+	pop_complete_buffers (stream, 5);
+
+	arv_camera_execute_command (camera, "AcquisitionStop", &error);
+	g_assert (error == NULL);
+	g_usleep (200000);
+	g_assert_false (stream_socket_receives_foreign_datagram (stream, 200000));
+
+	g_assert_cmpuint (arv_stream_get_info_uint64_by_name (stream, "n_foreign_source_packets"), ==, 0);
+
+	arv_camera_stop_acquisition (camera, &error);
+	g_assert (error == NULL);
+
+	g_clear_object (&stream);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -287,6 +411,7 @@ main (int argc, char *argv[])
 	g_test_add_func ("/fakegv/acquisition", acquisition_test);
 	g_test_add_func ("/fakegv/stream", stream_test);
 	g_test_add_func ("/fakegv/dynamic_roi", dynamic_roi_test);
+	g_test_add_func ("/fakegv/connected_socket", connected_socket_test);
 
 	result = g_test_run();
 
