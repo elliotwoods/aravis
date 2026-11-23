@@ -63,6 +63,12 @@
 #include <mach/mach.h>
 #include <pthread.h>
 #include <sys/sysctl.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <unistd.h>
 #endif
 
 #define ARV_GV_STREAM_DISCARD_LATE_FRAME_THRESHOLD	100
@@ -71,6 +77,11 @@
 #define ARV_GV_STREAM_MIN_BUFFER_SIZE                   20 * 1024
 #define ARV_GV_STREAM_SOCKET_BUFFER_FLOOR               (1024 * 1024)
 #define ARV_GV_STREAM_SOCKET_BUFFER_MAX_REQUEST         (64 * 1024 * 1024) /* "max" where the limit can't be read */
+#define ARV_GV_STREAM_RX_BATCH_DEFAULT                  64
+#define ARV_GV_STREAM_RX_BATCH_MAX                      256  /* kern.ipc.maxrecvmsgx */
+#define ARV_GV_STREAM_RX_LOWAT_PACKETS_DEFAULT          16
+#define ARV_GV_STREAM_RX_ACTIVE_WAIT_US                 1000 /* longest wait while a stream is active */
+#define ARV_GV_STREAM_RX_ACTIVE_US                      100000 /* active: frames open or a packet this recently */
 
 enum {
 	ARV_GV_STREAM_PROPERTY_0,
@@ -228,6 +239,15 @@ struct _ArvGvStreamThreadData {
 	guint64 thread_priority_mode;		/* 0 default, 1 high (QoS), 2 realtime: what was achieved */
 	guint64 stream_thread_min_priority;	/* lowest scheduler priority observed (Apple only) */
 	guint64 last_thread_stats_us;
+	guint64 rx_mode;			/* 0 legacy _loop (or packet socket), 1 recvmsg_x (Apple only) */
+	guint64 n_rx_truncated;			/* recvmsg_x slots that came back full, not processed */
+
+	/* Connected stream socket (ARV_GV_STREAM_CONNECT, see _connect_to_source) */
+	gboolean connect_socket;		/* connect once the sender is known from traffic */
+	guint64 socket_connected;		/* 1 once the stream socket is connected to the sender */
+	guint64 n_rx_foreign_source;		/* datagrams seen unconnected from another address, or the GVCP port */
+	guint64 n_resend_send_errors;		/* PACKETRESEND commands the socket refused to send */
+	GSocket *resend_socket;			/* sends PACKETRESEND while the stream socket is connected */
 
 	ArvHistogram *histogram;
 	guint32 statistic_count;
@@ -248,6 +268,8 @@ _send_packet_request (ArvGvStreamThreadData *thread_data,
 {
 	ArvGvcpPacket *packet;
 	size_t packet_size;
+	GSocket *socket;
+	GError *error = NULL;
 
 	thread_data->packet_id = arv_gvcp_next_packet_id (thread_data->packet_id);
 
@@ -260,10 +282,91 @@ _send_packet_request (ArvGvStreamThreadData *thread_data,
 
 	arv_gvcp_packet_debug (packet, ARV_DEBUG_LEVEL_DEBUG);
 
-	g_socket_send_to (thread_data->socket, thread_data->device_socket_address, (const char *) packet, packet_size,
-			  NULL, NULL);
+	/* A connected stream socket can't send to the GVCP port (EISCONN): the request goes out on its own
+	 * socket, bound to the same interface address */
+	socket = thread_data->resend_socket != NULL ? thread_data->resend_socket : thread_data->socket;
+
+	if (g_socket_send_to (socket, thread_data->device_socket_address, (const char *) packet, packet_size,
+			      NULL, &error) < 0) {
+		thread_data->n_resend_send_errors++;
+		if (thread_data->n_resend_send_errors == 1)
+			arv_warning_stream_thread ("[GvStream::send_packet_request] Can't send a packet resend"
+						   " request (%s); further failures are counted in"
+						   " n_resend_send_errors", error != NULL ? error->message : "unknown");
+		g_clear_error (&error);
+	}
 
 	arv_gvcp_packet_free (packet);
+}
+
+/* ARV_GV_STREAM_CONNECT (1 or 0; unset: on for Apple, off elsewhere). On macOS the kernel charges far more
+ * per datagram for an unconnected UDP socket receiving from a non-loopback address than for a connected one
+ * (standalone benchmark, 8968-byte datagrams, recvmsg_x batches of 64: 8.4 to 11.8 us against 1.4 to 2.0 us
+ * per datagram, and the unconnected receiver lost packets). The stream socket is therefore connected to the
+ * sender, which is learnt from the first datagram received from the device address, not from the
+ * ArvGevSCSP register: a device that reports a wrong source port there would otherwise see every packet
+ * filtered out. Datagrams queued before connect() stay readable (checked on macOS 26, loopback and
+ * bridge101). After connect(), the kernel drops datagrams from any other address or port, so a stream
+ * coming from another source port would show as a stalled n_received_packets with rising
+ * n_missing_packets and timeouts. A datagram from another address, or from the device's GVCP port, seen
+ * while unconnected is counted in n_rx_foreign_source, processed as before, and the socket stays
+ * unconnected.
+ *
+ * Returns TRUE when no further source address is needed: the socket is connected, or connecting failed
+ * and is not retried. */
+
+static gboolean
+_connect_to_source (ArvGvStreamThreadData *thread_data, GSocketAddress *source)
+{
+	GInetSocketAddress *inet_source;
+	GError *error = NULL;
+	GSocket *resend_socket;
+
+	if (source == NULL || !G_IS_INET_SOCKET_ADDRESS (source))
+		return FALSE;
+
+	inet_source = G_INET_SOCKET_ADDRESS (source);
+	/* GVSP never comes from the GVCP port: a reply from there (a device answering a resend request sent
+	 * from this socket before the connection) must not become the only accepted source */
+	if (!g_inet_address_equal (g_inet_socket_address_get_address (inet_source), thread_data->device_address) ||
+	    g_inet_socket_address_get_port (inet_source) == ARV_GVCP_PORT) {
+		thread_data->n_rx_foreign_source++;
+		return FALSE;
+	}
+
+	/* The resend socket first: without it, a connected stream socket could not send resend requests */
+	resend_socket = g_socket_new (G_SOCKET_FAMILY_IPV4, G_SOCKET_TYPE_DATAGRAM, G_SOCKET_PROTOCOL_UDP, &error);
+	if (resend_socket != NULL) {
+		g_socket_set_blocking (resend_socket, FALSE);
+		if (!g_socket_bind (resend_socket, thread_data->interface_socket_address, FALSE, &error))
+			g_clear_object (&resend_socket);
+	}
+	if (resend_socket == NULL) {
+		arv_warning_stream_thread ("[GvStream::connect_to_source] Can't create the resend socket (%s),"
+					   " the stream socket stays unconnected",
+					   error != NULL ? error->message : "unknown");
+		g_clear_error (&error);
+		thread_data->connect_socket = FALSE;
+		return TRUE;
+	}
+
+	if (!g_socket_connect (thread_data->socket, source, NULL, &error)) {
+		arv_warning_stream_thread ("[GvStream::connect_to_source] Can't connect the stream socket (%s),"
+					   " it stays unconnected", error != NULL ? error->message : "unknown");
+		g_clear_error (&error);
+		g_object_unref (resend_socket);
+		thread_data->connect_socket = FALSE;
+		return TRUE;
+	}
+
+	thread_data->resend_socket = resend_socket;
+	thread_data->socket_connected = 1;
+
+	arv_info_stream_thread ("[GvStream::connect_to_source] Stream socket connected to the sender port %u"
+				" (ArvGevSCSP reads %u)", g_inet_socket_address_get_port (inet_source),
+				thread_data->source_stream_port);
+
+	return TRUE;
 }
 
 static guint64
@@ -1322,6 +1425,7 @@ _loop (ArvGvStreamThreadData *thread_data)
 	int i;
 	GInputVector packet_iv[ARV_GV_STREAM_NUM_BUFFERS] = { {NULL, 0}, };
 	GInputMessage packet_im[ARV_GV_STREAM_NUM_BUFFERS] = { {NULL, NULL, 0, 0, 0, NULL, NULL}, };
+	GSocketAddress *packet_addresses[ARV_GV_STREAM_NUM_BUFFERS] = { NULL, };
 	// we don't need to consider the IP and UDP header size
 	guint packet_buffer_size = thread_data->scps_packet_size - 20 - 8;
 
@@ -1368,9 +1472,17 @@ _loop (ArvGvStreamThreadData *thread_data)
 
 		if (poll_fd[0].revents != 0) {
                         GError *error = NULL;
+                        gboolean want_source;
                         int n_msgs;
 
 			thread_data->n_rx_wakeups++;
+
+			/* Source addresses are asked for only until the socket is connected (_connect_to_source) */
+			want_source = thread_data->connect_socket && !thread_data->socket_connected;
+			for (i = 0; i < ARV_GV_STREAM_NUM_BUFFERS; i++) {
+				packet_addresses[i] = NULL;
+				packet_im[i].address = want_source ? &packet_addresses[i] : NULL;
+			}
 
 			arv_gpollfd_clear_one (&poll_fd[0], thread_data->socket);
 			n_msgs = g_socket_receive_messages (thread_data->socket,
@@ -1386,6 +1498,9 @@ _loop (ArvGvStreamThreadData *thread_data)
                                 if ((guint64) n_msgs > thread_data->n_rx_max_batch)
                                         thread_data->n_rx_max_batch = n_msgs;
                                 for (i = 0; i < n_msgs; i++) {
+                                        if (G_UNLIKELY (want_source) &&
+                                            _connect_to_source (thread_data, packet_addresses[i]))
+                                                want_source = FALSE;
                                         frame = _process_packet (thread_data,
                                                                  packet_iv[i].buffer,
                                                                  packet_im[i].bytes_received,
@@ -1397,6 +1512,9 @@ _loop (ArvGvStreamThreadData *thread_data)
                                                            error != NULL ? error->message : "Unknown reason");
                                 g_clear_error (&error);
                         }
+
+			for (i = 0; i < ARV_GV_STREAM_NUM_BUFFERS; i++)
+				g_clear_object (&packet_addresses[i]);
                 } else {
                         time_us = g_get_monotonic_time ();
                         _check_frame_completion (thread_data, time_us, NULL);
@@ -1412,6 +1530,316 @@ _loop (ArvGvStreamThreadData *thread_data)
 	arv_gpollfd_finish_all (poll_fd,1);
 	g_free (packet_buffers);
 }
+
+#ifdef __APPLE__
+
+/* recvmsg_x is a private Darwin system call wrapper exported by libsystem_kernel, not declared in the
+ * SDK. It receives up to cnt datagrams in one call and returns how many it received, or -1. Only
+ * MSG_DONTWAIT / MSG_NBIO are accepted as flags, and cnt is clamped to kern.ipc.maxrecvmsgx. On
+ * return, msg_datalen is the number of bytes copied into the message, and a datagram larger than its
+ * iovec is truncated silently. Layout from XNU bsd/sys/socket_private.h. */
+
+typedef struct {
+	void *msg_name;
+	socklen_t msg_namelen;
+	struct iovec *msg_iov;
+	int msg_iovlen;
+	void *msg_control;
+	socklen_t msg_controllen;
+	int msg_flags;
+	size_t msg_datalen;
+} ArvGvStreamMsghdrX;
+
+typedef ssize_t (*ArvGvStreamRecvmsgX) (int s, const ArvGvStreamMsghdrX *msgp, u_int cnt, int flags);
+
+static guint
+_get_env_uint (const char *name, guint default_value, guint max_value)
+{
+	const char *env;
+	char *end = NULL;
+	guint64 value;
+
+	env = g_getenv (name);
+	if (env == NULL)
+		return default_value;
+
+	value = g_ascii_strtoull (env, &end, 10);
+	if (end == env || *end != '\0') {
+		arv_warning_stream_thread ("[GvStream::loop_darwin] Invalid %s '%s' (expected an integer), using %u",
+					   name, env, default_value);
+		return default_value;
+	}
+
+	return MIN (value, max_value);
+}
+
+/* Receive loop for Apple. There, GLib's g_socket_receive_messages is one recvmsg per datagram plus a
+ * failing call that builds a GError at the end of each drain, and _loop's g_poll returned every 3 to 4
+ * datagrams of a fast stream. This loop receives up to ARV_GV_STREAM_RX_BATCH datagrams per system call with
+ * recvmsg_x, and waits in kevent with a NOTE_LOWAT low-water mark, so that a wakeup finds a batch.
+ *
+ * The thread must block when the socket is empty: it runs under the Mach time constraint policy, and
+ * the kernel demotes a real-time thread that computes without blocking. The wait is in kevent and not
+ * in a blocking receive, as a thread blocked in the receive call is woken for every datagram.
+ *
+ * While a stream is active (a frame is open, or a packet arrived in the last
+ * ARV_GV_STREAM_RX_ACTIVE_US), the wait is at most ARV_GV_STREAM_RX_ACTIVE_WAIT_US (and never longer
+ * than the packet timeouts), so that a tail of packets below the low-water mark, a lost trailer or a
+ * resend deadline is not delayed by more than that. When idle, the low-water mark is one datagram and
+ * the wait is ARV_GV_STREAM_POLL_TIMEOUT_US, as in _loop.
+ *
+ * Returns FALSE, before signalling the thread start, when it can't be set up; the caller then runs
+ * _loop. */
+
+static gboolean
+_loop_darwin (ArvGvStreamThreadData *thread_data, ArvGvStreamRecvmsgX recvmsg_x_func, guint batch_size)
+{
+	ArvGvStreamMsghdrX *hdrs;
+	struct iovec *iovs;
+	struct sockaddr_storage *names;
+	gboolean want_source;
+	struct kevent changes[2];
+	struct kevent events[2];
+	GPollFD cancel_fd = {-1, 0, 0};
+	gboolean use_cancel_fd;
+	char *slots;
+	gsize slot_size;
+	guint64 time_us;
+	guint64 last_rx_us = 0;
+	guint lowat_packets;
+	int lowat_bytes;
+	int current_lowat = -1;
+	gboolean kevent_error_reported = FALSE;
+	guint active_wait_us;
+	int socket_fd;
+	int kq;
+	guint i;
+
+	socket_fd = g_socket_get_fd (thread_data->socket);
+
+	kq = kqueue ();
+	if (kq < 0) {
+		arv_warning_stream_thread ("[GvStream::loop_darwin] kqueue failed (%s), using the standard loop",
+					   g_strerror (errno));
+		return FALSE;
+	}
+
+	/* The UDP payload is at most scps_packet_size - 28 bytes; the margin makes a full slot unambiguous */
+	slot_size = ((gsize) thread_data->scps_packet_size + 64 + 63) & ~((gsize) 63);
+	/* posix_memalign rather than g_aligned_alloc, which needs GLib 2.72 */
+	if (posix_memalign ((void **) &slots, 64, batch_size * slot_size) != 0) {
+		arv_warning_stream_thread ("[GvStream::loop_darwin] Can't allocate %u receive slots, using the"
+					   " standard loop", batch_size);
+		close (kq);
+		return FALSE;
+	}
+	hdrs = g_new0 (ArvGvStreamMsghdrX, batch_size);
+	iovs = g_new0 (struct iovec, batch_size);
+	names = g_new0 (struct sockaddr_storage, batch_size);
+
+	for (i = 0; i < batch_size; i++) {
+		iovs[i].iov_base = slots + i * slot_size;
+		iovs[i].iov_len = slot_size;
+		hdrs[i].msg_iov = &iovs[i];
+		hdrs[i].msg_iovlen = 1;
+	}
+
+	lowat_packets = _get_env_uint ("ARV_GV_STREAM_RX_LOWAT_PACKETS", ARV_GV_STREAM_RX_LOWAT_PACKETS_DEFAULT,
+				       G_MAXINT / 65536);
+	/* 0 or 1: wake on the first datagram, whatever its size */
+	lowat_bytes = lowat_packets <= 1 ? 1 : (int) lowat_packets * (int) (thread_data->scps_packet_size - 20 - 8);
+
+	active_wait_us = MIN (ARV_GV_STREAM_RX_ACTIVE_WAIT_US,
+			      MIN (thread_data->packet_timeout_us, thread_data->initial_packet_timeout_us));
+	active_wait_us = MAX (active_wait_us, 100);
+
+	use_cancel_fd = g_cancellable_make_pollfd (thread_data->cancellable, &cancel_fd);
+	if (use_cancel_fd) {
+		EV_SET (&changes[0], cancel_fd.fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+		if (kevent (kq, changes, 1, NULL, 0, NULL) < 0) {
+			arv_warning_stream_thread ("[GvStream::loop_darwin] Can't watch the cancellable (%s)",
+						   g_strerror (errno));
+			g_cancellable_release_fd (thread_data->cancellable);
+			use_cancel_fd = FALSE;
+		}
+	}
+
+	thread_data->rx_mode = 1;
+
+	arv_info_stream ("[GvStream::loop_darwin] recvmsg_x method, batch %u, slot %" G_GSIZE_FORMAT
+			 " bytes, low-water mark %u packets (%d bytes), active wait %u us",
+			 batch_size, slot_size, lowat_packets, lowat_bytes, active_wait_us);
+
+        g_mutex_lock (&thread_data->thread_started_mutex);
+        thread_data->thread_started = TRUE;
+        g_cond_signal (&thread_data->thread_started_cond);
+        g_mutex_unlock (&thread_data->thread_started_mutex);
+
+	time_us = g_get_monotonic_time ();
+
+	do {
+		struct timespec timeout;
+		gboolean active;
+		gboolean socket_ready = FALSE;
+		guint64 n_drained = 0;
+		guint64 wait_us;
+		int n_changes = 0;
+		int wanted_lowat;
+		int n_events;
+		int errsv;
+
+		active = thread_data->frames != NULL || time_us - last_rx_us < ARV_GV_STREAM_RX_ACTIVE_US;
+
+		/* When idle, wake on the first datagram */
+		wanted_lowat = active ? lowat_bytes : 1;
+		if (wanted_lowat != current_lowat) {
+			EV_SET (&changes[0], socket_fd, EVFILT_READ, EV_ADD, NOTE_LOWAT, wanted_lowat, NULL);
+			n_changes = 1;
+			current_lowat = wanted_lowat;
+		}
+
+		wait_us = active ? active_wait_us : ARV_GV_STREAM_POLL_TIMEOUT_US;
+		timeout.tv_sec = wait_us / 1000000;
+		timeout.tv_nsec = (wait_us % 1000000) * 1000;
+
+		do {
+			n_events = kevent (kq, changes, n_changes, events, G_N_ELEMENTS (events), &timeout);
+			errsv = errno;
+		} while (n_events < 0 && errsv == EINTR);
+
+		if (n_events < 0) {
+			arv_warning_stream_thread ("[GvStream::loop_darwin] kevent failed (%s)", g_strerror (errsv));
+			current_lowat = -1;
+			/* Never spin on a failing kevent */
+			g_usleep (active_wait_us);
+		}
+
+		for (i = 0; n_events > 0 && i < (guint) n_events; i++) {
+			if (G_UNLIKELY (events[i].flags & EV_ERROR)) {
+				/* A refused registration is not retried at once, which would spin: the wait
+				 * degrades to the timeouts until the low-water mark changes */
+				if (!kevent_error_reported)
+					arv_warning_stream_thread ("[GvStream::loop_darwin] kevent registration of fd %d"
+								   " failed (%s)", (int) events[i].ident,
+								   g_strerror ((int) events[i].data));
+				kevent_error_reported = TRUE;
+				continue;
+			}
+			if (events[i].ident == (uintptr_t) socket_fd && events[i].filter == EVFILT_READ)
+				socket_ready = TRUE;
+		}
+
+		if (socket_ready)
+			thread_data->n_rx_wakeups++;
+
+		/* Drain the socket, whatever woke the thread: after a timeout there may be a tail below the
+		 * low-water mark. A batch shorter than requested means the queue was empty. */
+		for (;;) {
+			ArvGvStreamFrameData *frame = NULL;
+			ssize_t n_msgs;
+
+			/* Source addresses are asked for only until the socket is connected (_connect_to_source):
+			 * the per-datagram name copy is a cost */
+			want_source = thread_data->connect_socket && !thread_data->socket_connected;
+			for (i = 0; i < batch_size; i++) {
+				hdrs[i].msg_datalen = slot_size;
+				hdrs[i].msg_flags = 0;
+				hdrs[i].msg_name = want_source ? &names[i] : NULL;
+				hdrs[i].msg_namelen = want_source ? sizeof (names[i]) : 0;
+			}
+
+			n_msgs = recvmsg_x_func (socket_fd, hdrs, batch_size, MSG_DONTWAIT);
+			if (n_msgs <= 0) {
+				if (n_msgs < 0 && errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)
+					arv_warning_stream_thread ("[GvStream::loop_darwin] recvmsg_x failed: %s",
+								   g_strerror (errno));
+				break;
+			}
+
+			time_us = g_get_monotonic_time ();
+			last_rx_us = time_us;
+			n_drained += n_msgs;
+
+			thread_data->n_rx_batches++;
+			if ((guint64) n_msgs > thread_data->n_rx_max_batch)
+				thread_data->n_rx_max_batch = n_msgs;
+
+			for (i = 0; i < (guint) n_msgs; i++) {
+				if (G_UNLIKELY (hdrs[i].msg_datalen >= slot_size)) {
+					/* Possibly truncated: never larger than scps_packet_size in a valid stream */
+					thread_data->n_rx_truncated++;
+					continue;
+				}
+
+				if (G_UNLIKELY (want_source) && hdrs[i].msg_namelen > 0) {
+					GSocketAddress *source;
+
+					source = g_socket_address_new_from_native (&names[i], hdrs[i].msg_namelen);
+					if (_connect_to_source (thread_data, source))
+						want_source = FALSE;
+					g_clear_object (&source);
+				}
+
+				frame = _process_packet (thread_data, iovs[i].iov_base, hdrs[i].msg_datalen, time_us);
+
+				/* Hand a finished frame over without waiting for the end of the batch */
+				if (frame != NULL && frame->last_valid_packet == frame->n_packets - 1) {
+					_check_frame_completion (thread_data, time_us, frame);
+					frame = NULL;
+				}
+			}
+
+			_check_frame_completion (thread_data, time_us, frame);
+			_sample_thread_stats (thread_data, time_us, FALSE);
+
+			if ((guint) n_msgs < batch_size ||
+			    g_cancellable_is_cancelled (thread_data->cancellable))
+				break;
+		}
+
+		if (n_drained == 0) {
+			time_us = g_get_monotonic_time ();
+			_check_frame_completion (thread_data, time_us, NULL);
+			_sample_thread_stats (thread_data, time_us, FALSE);
+		}
+
+	} while (!g_cancellable_is_cancelled (thread_data->cancellable));
+
+	if (use_cancel_fd)
+		g_cancellable_release_fd (thread_data->cancellable);
+
+	close (kq);
+	g_free (names);
+	g_free (iovs);
+	g_free (hdrs);
+	free (slots);
+
+	return TRUE;
+}
+
+/* ARV_GV_STREAM_RX_BATCH: datagrams per recvmsg_x call, 1 to 256, default 64; 0 selects _loop. Also
+ * _loop if recvmsg_x can't be resolved. */
+
+static ArvGvStreamRecvmsgX
+_get_recvmsg_x (guint *batch_size)
+{
+	ArvGvStreamRecvmsgX recvmsg_x_func;
+
+	*batch_size = _get_env_uint ("ARV_GV_STREAM_RX_BATCH", ARV_GV_STREAM_RX_BATCH_DEFAULT,
+				     ARV_GV_STREAM_RX_BATCH_MAX);
+	if (*batch_size == 0) {
+		arv_info_stream_thread ("[GvStream::loop_darwin] ARV_GV_STREAM_RX_BATCH=0, using the standard loop");
+		return NULL;
+	}
+
+	recvmsg_x_func = (ArvGvStreamRecvmsgX) dlsym (RTLD_DEFAULT, "recvmsg_x");
+	if (recvmsg_x_func == NULL)
+		arv_warning_stream_thread ("[GvStream::loop_darwin] recvmsg_x not found, using the standard loop");
+
+	return recvmsg_x_func;
+}
+
+#endif /* __APPLE__ */
 
 
 #if ARAVIS_HAS_PACKET_SOCKET
@@ -1772,8 +2200,9 @@ _thread_priority_to_string (ArvGvStreamThreadPriority mode)
  *
  * On Apple, realtime is the Mach time constraint policy (see arv_make_thread_realtime). The kernel
  * demotes a real-time thread that computes for about 100 quanta without blocking; _loop blocks in
- * g_poll whenever the socket is empty, which resets that counter. A receive loop that never blocks
- * (busy polling) would be demoted, which stream_thread_min_priority makes visible. */
+ * g_poll, and _loop_darwin in kevent, whenever the socket is empty, which resets that counter. A
+ * receive loop that never blocks (busy polling) would be demoted, which stream_thread_min_priority
+ * makes visible. */
 
 static void
 _configure_thread_priority (ArvGvStreamThreadData *thread_data)
@@ -1845,6 +2274,10 @@ arv_gv_stream_thread (void *data)
 #if ARAVIS_HAS_PACKET_SOCKET
 	int fd;
 #endif
+#ifdef __APPLE__
+	ArvGvStreamRecvmsgX recvmsg_x_func;
+	guint rx_batch_size;
+#endif
 
 	thread_data->frames = NULL;
 	thread_data->last_frame_id = 0;
@@ -1862,6 +2295,10 @@ arv_gv_stream_thread (void *data)
 		close (fd);
 		_ring_buffer_loop (thread_data);
 	} else
+#endif
+#ifdef __APPLE__
+	if ((recvmsg_x_func = _get_recvmsg_x (&rx_batch_size)) == NULL ||
+	    !_loop_darwin (thread_data, recvmsg_x_func, rx_batch_size))
 #endif
 		_loop (thread_data);
 
@@ -2057,6 +2494,31 @@ arv_gv_stream_init (ArvGvStream *gv_stream)
 	priv->thread_data = g_new0 (ArvGvStreamThreadData, 1);
 }
 
+/* ARV_GV_STREAM_CONNECT: see _connect_to_source */
+
+static gboolean
+_get_connect_option (void)
+{
+#ifdef __APPLE__
+	gboolean default_value = TRUE;
+#else
+	gboolean default_value = FALSE;
+#endif
+	const char *env;
+
+	env = g_getenv ("ARV_GV_STREAM_CONNECT");
+	if (env == NULL)
+		return default_value;
+	if (g_strcmp0 (env, "1") == 0)
+		return TRUE;
+	if (g_strcmp0 (env, "0") == 0)
+		return FALSE;
+
+	arv_warning_stream ("[GvStream::stream_new] Invalid ARV_GV_STREAM_CONNECT '%s' (expected 1 or 0), using %d",
+			    env, default_value);
+	return default_value;
+}
+
 static void
 _read_env_uint (const char *name, guint *value)
 {
@@ -2188,6 +2650,8 @@ arv_gv_stream_constructed (GObject *object)
 
 	priv->thread_data->packet_id = 65300;
 
+	priv->thread_data->connect_socket = _get_connect_option ();
+
 	/* The construct properties already hold their defaults (or the caller's values); the environment overrides
 	 * them only where it is set. A later g_object_set still wins. */
 	priv->thread_data->fast_fail = _read_fast_fail ();
@@ -2286,6 +2750,16 @@ arv_gv_stream_constructed (GObject *object)
                                  G_TYPE_UINT64, &priv->thread_data->thread_priority_mode);
         arv_stream_declare_info (ARV_STREAM (gv_stream), "stream_thread_min_priority",
                                  G_TYPE_UINT64, &priv->thread_data->stream_thread_min_priority);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "rx_mode",
+                                 G_TYPE_UINT64, &priv->thread_data->rx_mode);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_rx_truncated",
+                                 G_TYPE_UINT64, &priv->thread_data->n_rx_truncated);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "socket_connected",
+                                 G_TYPE_UINT64, &priv->thread_data->socket_connected);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_rx_foreign_source",
+                                 G_TYPE_UINT64, &priv->thread_data->n_rx_foreign_source);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_resend_send_errors",
+                                 G_TYPE_UINT64, &priv->thread_data->n_resend_send_errors);
 
 	arv_gv_stream_start_thread (ARV_STREAM (gv_stream));
 }
@@ -2363,7 +2837,15 @@ arv_gv_stream_finalize (GObject *object)
 		g_clear_object (&thread_data->interface_address);
 		g_clear_object (&thread_data->device_socket_address);
 		g_clear_object (&thread_data->interface_socket_address);
+		arv_info_stream ("[GvStream::finalize] socket_connected       = %" G_GUINT64_FORMAT,
+				  thread_data->socket_connected);
+		arv_info_stream ("[GvStream::finalize] n_rx_foreign_source    = %" G_GUINT64_FORMAT,
+				  thread_data->n_rx_foreign_source);
+		arv_info_stream ("[GvStream::finalize] n_resend_send_errors   = %" G_GUINT64_FORMAT,
+				  thread_data->n_resend_send_errors);
+
 		g_clear_object (&thread_data->socket);
+		g_clear_object (&thread_data->resend_socket);
 
 		g_clear_pointer (&thread_data, g_free);
 	}
