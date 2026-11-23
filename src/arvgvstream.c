@@ -243,6 +243,7 @@ struct _ArvGvStreamThreadData {
 	guint64 last_thread_stats_us;
 	guint64 rx_mode;			/* 0 legacy _loop (or packet socket), 1 recvmsg_x (Apple only) */
 	guint64 n_rx_truncated;			/* recvmsg_x slots that came back full, not processed */
+	guint64 n_short_packets;		/* datagrams too short for their GVSP headers, not processed */
 
 	/* Connected stream socket (ARV_GV_STREAM_CONNECT, see _connect_to_source) */
 	gboolean connect_socket;		/* connect once the sender is known from traffic */
@@ -729,6 +730,11 @@ _find_frame_data (ArvGvStreamThreadData *thread_data,
 		_drop_frame (thread_data, frame_id, frame_id_inc, FALSE);
 		return NULL;
 	}
+
+	/* A status packet answers a resend request for a frame already open; one for a newer frame starts nothing,
+	 * and its leader, if it claims to be one, is not read (_gvsp_packet_size_is_valid does not check it) */
+	if (G_UNLIKELY (arv_gvsp_packet_type_is_error (arv_gvsp_packet_get_packet_type (packet))))
+		return NULL;
 
 	buffer = arv_stream_pop_input_buffer (thread_data->stream);
 	if (buffer == NULL) {
@@ -1309,6 +1315,53 @@ _flush_frames (ArvGvStreamThreadData *thread_data,
 	thread_data->frames = NULL;
 }
 
+/* Whether a datagram is long enough for every field the receiver reads from it: the GVSP header (the standard one,
+ * then, once its extended-id flag can be read, the extended one) and, for a leader, the leader with its image or
+ * multipart part information. Without it, the payload size of a short packet underflows and its copy runs past the
+ * receive slot, and the fields of a short header are read from whatever the slot held before. Error status packets
+ * are header only and are exempt from the leader check; they never start a frame (_find_frame_data), which is where
+ * a leader would be read. */
+
+static inline gboolean
+_gvsp_packet_size_is_valid (const ArvGvspPacket *packet, size_t packet_size)
+{
+	size_t header_size;
+	size_t leader_size;
+
+	if (G_UNLIKELY (packet_size < sizeof (ArvGvspPacket) + sizeof (ArvGvspHeader)))
+		return FALSE;
+
+	if (G_UNLIKELY (arv_gvsp_packet_has_extended_ids (packet))) {
+		header_size = sizeof (ArvGvspPacket) + sizeof (ArvGvspExtendedHeader);
+		if (packet_size < header_size)
+			return FALSE;
+	} else
+		header_size = sizeof (ArvGvspPacket) + sizeof (ArvGvspHeader);
+
+	if (G_LIKELY (arv_gvsp_packet_get_content_type (packet) != ARV_GVSP_CONTENT_TYPE_LEADER) ||
+	    arv_gvsp_packet_type_is_error (arv_gvsp_packet_get_packet_type (packet)))
+		return TRUE;
+
+	if (packet_size < header_size + sizeof (ArvGvspLeader))
+		return FALSE;
+
+	switch (arv_gvsp_leader_packet_get_buffer_payload_type (packet, NULL)) {
+		case ARV_BUFFER_PAYLOAD_TYPE_IMAGE:
+		case ARV_BUFFER_PAYLOAD_TYPE_EXTENDED_CHUNK_DATA:
+			leader_size = sizeof (ArvGvspImageLeader);
+			break;
+		case ARV_BUFFER_PAYLOAD_TYPE_MULTIPART:
+			leader_size = sizeof (ArvGvspMultipartLeader) +
+				(size_t) arv_gvsp_leader_packet_get_multipart_n_parts (packet) * sizeof (ArvGvspPartInfos);
+			break;
+		default:
+			leader_size = sizeof (ArvGvspLeader);
+			break;
+	}
+
+	return packet_size >= header_size + leader_size;
+}
+
 static ArvGvStreamFrameData *
 _process_packet (ArvGvStreamThreadData *thread_data, const ArvGvspPacket *packet, size_t packet_size, guint64 time_us)
 
@@ -1317,6 +1370,13 @@ _process_packet (ArvGvStreamThreadData *thread_data, const ArvGvspPacket *packet
 	guint32 packet_id;
 	guint64 frame_id;
 	int i;
+
+	/* Every receive loop passes through here: a datagram too short to be read is counted and dropped, whatever
+	 * sent it (the stream socket accepts any sender while it is unconnected) */
+	if (G_UNLIKELY (!_gvsp_packet_size_is_valid (packet, packet_size))) {
+		thread_data->n_short_packets++;
+		return NULL;
+	}
 
 	thread_data->n_received_packets++;
 
@@ -1502,6 +1562,8 @@ _loop (ArvGvStreamThreadData *thread_data)
                                         thread_data->n_rx_max_batch = n_msgs;
                                 for (i = 0; i < n_msgs; i++) {
                                         if (G_UNLIKELY (want_source) &&
+                                            _gvsp_packet_size_is_valid (packet_iv[i].buffer,
+                                                                        packet_im[i].bytes_received) &&
                                             _connect_to_source (thread_data, packet_addresses[i]))
                                                 want_source = FALSE;
                                         frame = _process_packet (thread_data,
@@ -1636,6 +1698,8 @@ _loop_darwin (ArvGvStreamThreadData *thread_data, ArvGvStreamRecvmsgX recvmsg_x_
 		close (kq);
 		return FALSE;
 	}
+	/* Never processed before being written, but a defect elsewhere should read zeros, not old heap contents */
+	memset (slots, 0, batch_size * slot_size);
 	hdrs = g_new0 (ArvGvStreamMsghdrX, batch_size);
 	iovs = g_new0 (struct iovec, batch_size);
 	names = g_new0 (struct sockaddr_storage, batch_size);
@@ -1774,7 +1838,8 @@ _loop_darwin (ArvGvStreamThreadData *thread_data, ArvGvStreamRecvmsgX recvmsg_x_
 					continue;
 				}
 
-				if (G_UNLIKELY (want_source) && hdrs[i].msg_namelen > 0) {
+				if (G_UNLIKELY (want_source) && hdrs[i].msg_namelen > 0 &&
+				    _gvsp_packet_size_is_valid (iovs[i].iov_base, hdrs[i].msg_datalen)) {
 					GSocketAddress *source;
 
 					source = g_socket_address_new_from_native (&names[i], hdrs[i].msg_namelen);
@@ -2144,9 +2209,18 @@ _ring_buffer_loop (ArvGvStreamThreadData *thread_data)
 				const ArvGvspPacket *packet;
 				size_t size;
 
+				gint64 ip_size;
+				gint64 captured_size;
+
 				ip = (void *) (((char *) header) + header->tp_mac + ETH_HLEN);
 				packet = (void *) (((char *) ip) + sizeof (struct iphdr) + sizeof (struct udphdr));
-				size = g_ntohs (ip->tot_len) -  sizeof (struct iphdr) - sizeof (struct udphdr);
+				/* Signed: a datagram shorter than its IP and UDP headers must not underflow into a huge
+				 * size, and the size is never more than what the ring captured */
+				ip_size = (gint64) g_ntohs (ip->tot_len) -
+					(gint64) (sizeof (struct iphdr) + sizeof (struct udphdr));
+				captured_size = (gint64) header->tp_snaplen -
+					(gint64) (ETH_HLEN + sizeof (struct iphdr) + sizeof (struct udphdr));
+				size = MAX (0, MIN (ip_size, captured_size));
 
 				frame = _process_packet (thread_data, packet, size, time_us);
 
@@ -2760,6 +2834,8 @@ arv_gv_stream_constructed (GObject *object)
                                  G_TYPE_UINT64, &priv->thread_data->rx_mode);
         arv_stream_declare_info (ARV_STREAM (gv_stream), "n_rx_truncated",
                                  G_TYPE_UINT64, &priv->thread_data->n_rx_truncated);
+        arv_stream_declare_info (ARV_STREAM (gv_stream), "n_short_packets",
+                                 G_TYPE_UINT64, &priv->thread_data->n_short_packets);
         arv_stream_declare_info (ARV_STREAM (gv_stream), "socket_connected",
                                  G_TYPE_UINT64, &priv->thread_data->socket_connected);
         arv_stream_declare_info (ARV_STREAM (gv_stream), "n_rx_foreign_source",
